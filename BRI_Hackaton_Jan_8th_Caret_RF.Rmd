@@ -1,0 +1,544 @@
+---
+title: "BRI Hackathon"
+output: html_notebook
+---
+
+#0. Load Library
+
+```{r}
+rm(list = ls())
+```
+
+
+```{r}
+library(readr) #load the data
+library(dplyr) #use pipeline
+library(plyr) #count function
+library(stringr) #string manipulation
+library(vtreat) #one hot encoding to numerical and clean
+library(xgboost) #gradient boosted model
+library(naniar) #missing data summary
+library(visdat) #missing visualization
+library(CatEncoders) #categorical encoding
+```
+
+#1. Load Data
+
+```{r}
+df <- read_csv("train.csv")
+head(df)
+```
+
+#2. Feature Engineering
+
+```{r}
+str(df)
+```
+
+```{r}
+df1 <- df[ , sapply(df, class) == "character"] %>%
+  lapply(as.factor) %>%
+  as.data.frame()
+str(df1)
+lapply(df1, levels)
+```
+
+```{r}
+df %>%
+  filter(!(df1$year_graduated %in% c(1983:2020, NA)))
+```
+
+
+```{r}
+df1$year_graduated <- df1$year_graduated %>%
+  as.character() %>%
+  as.integer() %>%
+  ifelse(df1$year_graduated %in% c(1983:2020), ., NA) %>%
+  as.factor()
+
+count(df1$year_graduated)
+```
+
+
+```{r}
+str(df1)
+```
+
+```{r}
+count(df1$achievement_target_1)
+count(df1$achievement_target_2)
+count(df1$achievement_target_3)
+```
+
+
+```{r}
+achieve <- function(x, orb1, orb2 = NULL, new) {
+  ifelse(x %in% c(orb1, orb2), new, as.character(x)) %>%
+    as.factor()
+}
+
+```
+
+```{r}
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "Tidak diberikan target", new = "no_target")
+```
+
+```{r}
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "Tidak diberikan target", new = "no_target")
+```
+
+```{r}
+df1$achievement_target_3 <- achieve(df1$achievement_target_3, "not reached", new = "not_reached")
+```
+
+```{r}
+count(df1$achievement_target_1)
+count(df1$achievement_target_2)
+count(df1$achievement_target_3)
+```
+
+
+```{r}
+df2 <- df[ , sapply(df, class) == "numeric"] %>%
+  as.data.frame()
+```
+
+```{r}
+df3 <- cbind(df1, df2)
+str(df3)
+```
+
+
+```{r}
+#Checking missing variable
+miss_var_summary(df3)
+glimpse(df3)
+```
+
+```{r}
+#removing unnecessary factor levels in test set
+df3 <- df3 %>%
+  filter(as.integer(person_level) != 8) %>%
+  filter(as.integer(job_level) != 4)
+df3$job_level <- factor(df3$job_level)
+df3$person_level <- factor(df3$person_level)
+count(df3$person_level)
+count(df3$job_level)
+str(df3)
+```
+
+
+```{r}
+#Checking the Education_level, GPA, and year_graduated variables have the same missing case
+df3 %>%
+  filter(is.na(Education_level) & is.na(GPA) & is.na(year_graduated)) %>%
+  nrow()
+
+count(df3$Education_level)
+df3 %>%
+  filter(Education_level == "level_0") %>%
+  select(Education_level, GPA, year_graduated)
+
+miss_var_summary(df3)
+```
+
+```{r}
+#the result is 3503 which is exactly the total amount of NAs for GPA variable, it means all NAs in GPA indicate no education background which automatically explains no graduation
+
+count(df3$Education_level)
+df3$Education_level <- ifelse(is.na(df3$GPA) & is.na(df3$Education_level), "level_0", as.character(df3$Education_level)) %>% as.factor()
+count(df3$Education_level)
+
+count(df3$year_graduated)
+df3$year_graduated <- ifelse(is.na(df3$GPA) & is.na(df3$year_graduated), 0, as.character(df3$year_graduated))
+count(df3$year_graduated)
+
+count(df3$GPA)
+df3$GPA <- ifelse(is.na(df3$GPA), 0, as.numeric(df3$GPA))
+count(df3$GPA)
+
+miss_var_summary(df3)
+```
+
+
+```{r Identifying correlation between employee_status and the missingness of relevant variables}
+
+gg_miss_var(df3, facet = Employee_type)
+gg_miss_var(df3, facet = gender)
+gg_miss_var(df3, facet = person_level)
+gg_miss_var(df3, facet = job_level)
+gg_miss_var(df3, facet = marital_status_maried.Y.N.)
+gg_miss_var(df3, facet = Education_level)
+
+x <- as.data.frame(colnames(df3))
+
+con_var <- c(9:11, 20, 28:30)
+
+for(i in con_var) {
+  count(df3[[i]]) %>%
+    print()
+}
+```
+
+```{r}
+#removing unused var in test set
+df3 <- df3 %>%
+  filter(Employee_status != "Contract")
+count(df3$Employee_status)
+
+df3$Employee_status <- NULL
+
+miss_var_summary(df3)
+```
+
+
+```{r}
+#check all categorical variables
+factors <- df3[names(which(sapply(df3, is.factor)))]
+sapply(factors, levels)
+```
+
+```{r}
+#binary encoding for Binary variables
+df3$male <- df3$gender
+df3$married <- df3$marital_status_maried.Y.N.
+
+df3$male <- ifelse(df3$gender == "Male", 1, 0) %>% sapply(as.numeric)
+df3$married <- ifelse(df3$marital_status_maried.Y.N. == "Y", 1, 0) %>% sapply(as.numeric)
+df3$achievement_target_3 <- ifelse(df3$achievement_target_3 == "reached", 1, 0) %>% sapply(as.numeric)
+
+df3$gender <- NULL
+df3$marital_status_maried.Y.N. <- NULL
+
+str(df3)
+```
+
+```{r}
+#category binning year_grad var
+summary(as.numeric(as.character(df3$year_graduated)))
+df3 <- df3 %>%
+  mutate(year_grad =
+           as.factor(
+           case_when(year_graduated == 0 ~ "none",
+                     year_graduated >= 1980 & year_graduated <= 1990 ~ "1981 - 1990",
+                     year_graduated >= 1991 & year_graduated <= 2000 ~ "1991 - 2000",
+                     year_graduated >= 2001 & year_graduated <= 2010 ~ "2001 - 2010",
+                     year_graduated >= 2011 & year_graduated <= 2020 ~ "2011 - 2020")
+                    )
+         )
+count(df3$year_grad)
+df3$year_graduated <- NULL
+```
+
+
+```{r}
+#turning birthyear into age variable
+df3$age <- 2020 - df3$age
+```
+
+```{r}
+#simplifying variable names
+df3$number_of_dependences_male <- df3$`number_of_dependences (male)`
+df3$number_of_dependences_female <- df3$`number_of_dependences (female)`
+df3$avg_achievement_pct <- df3$`Avg_achievement_%`
+df3$last_achievement_pct <- df3$`Last_achievement_%`
+df3$achievement_above_100_pct_3quartal <- df3$`Achievement_above_100%_during3quartal`
+df3$best_performance <- df3$`Best Performance`
+df3$annual_leave <- df3$`annual leave`
+
+df3$`number_of_dependences (male)` <- NULL
+df3$`number_of_dependences (female)` <- NULL
+df3$`Avg_achievement_%` <- NULL
+df3$`Last_achievement_%` <- NULL
+df3$`Achievement_above_100%_during3quartal` <- NULL
+df3$`Best Performance` <- NULL
+df3$`annual leave` <- NULL
+```
+
+
+```{r}
+str(df3)
+miss_var_summary(df3)
+count(df3$best_performance)
+```
+
+
+```{r}
+#one hot encoding the rest of categorical vars
+library(caret)
+hot_var <- names(which(sapply(df3, is.factor)))
+hot_form <- as.formula(paste("~ ", paste(hot_var, collapse = " + ")))
+one_hot <- dummyVars(hot_form,
+                     data = df3)
+df5 <- data.frame(predict(one_hot,
+                          newdata = df3))
+names(df5)
+```
+
+```{r}
+#integrating one hot encoded vars to main dataframe
+fac_ind <- paste(which(sapply(df3, is.factor)), collapse = ", ")
+fac_ind
+df4 <- df3[c(-1:-6, -22)]
+str(df3)
+
+df6 <- cbind(df4, df5)
+str(df6)
+```
+
+
+```{r}
+gp <- runif(nrow(df6))
+df_train <- df6[gp < 0.8, ]
+df_test <- df6[gp >= 0.8, ]
+df_train$best_performance <- as.factor(df_train$best_performance)
+df_test$best_performance <- as.factor(df_test$best_performance)
+count(df_train$best_performance)
+count(df_test$best_performance)
+```
+
+
+```{r}
+#modeling with rf package
+library(ROSE)
+library(DMwR)
+library(ranger)
+library(BradleyTerry2)
+library(RANN)
+library(randomForest)
+
+start <- Sys.time()
+
+train_x <- df_train[-21]
+train_y <- ifelse(df_train$best_performance == 1, "yes", "no")
+ctrl <- trainControl(
+    method = "repeatedcv",
+    search = "random",
+    number = 6,
+    repeats = 5,
+    summaryFunction = twoClassSummary,
+    classProbs = TRUE,
+    sampling = "smote",
+    verboseIter = TRUE
+  )
+model <- train(
+  x = train_x,
+  y = train_y,
+  preProcess = c("zv", "knnImpute",  "center", "scale"),
+  method = "rf",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneLength = 5
+)
+finish <- Sys.time()
+time <- finish - start
+
+save(model, file = "E:/BRI Hackaton/model_rf_caret_4.rda")
+model
+```
+
+```{r}
+time
+```
+
+
+```{r}
+#test accuracy
+df_test$pred <- predict(model, newdata = df_test[-62], type = "prob")[ , "yes"]
+```
+
+```{r}
+library(caTools)
+colAUC(df_test$pred, df_test$best_performance, plotROC = TRUE)
+library(pROC)
+pred <- df_test %>%
+  select(best_performance, pred)
+count(pred)
+ROC <- roc(df_test$best_performance, df_test$pred)
+plot(ROC, col = "red")
+ROC$auc
+```
+
+#5. Predicting
+
+```{r}
+valid <- read_csv("test.csv")
+valid1 <- valid[ , sapply(valid, class) == "character"] %>%
+  lapply(as.factor) %>%
+  as.data.frame()
+```
+
+```{r}
+valid1$year_graduated <- valid1$year_graduated %>%
+  as.character() %>%
+  as.integer() %>%
+  ifelse(valid1$year_graduated %in% c(1983:2020), ., NA)
+```
+
+```{r}
+#target1
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "Tidak diberikan target", new = "no_target")
+
+#target2
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "Tidak diberikan target", new = "no_target")
+
+#target3
+valid1$achievement_target_3 <- achieve(valid1$achievement_target_3, "not reached", new = "not_reached")
+```
+
+```{r}
+valid2 <- valid[ , sapply(valid, class) == "numeric"] %>%
+  as.data.frame()
+```
+
+```{r}
+valid3 <- cbind(valid1, valid2)
+str(valid3)
+miss_var_summary(valid3)
+count(valid3$year_graduated)
+count(valid3$permanent_employee)
+```
+
+```{r}
+#removing unused var in test set
+valid3 <- valid3 %>%
+  filter(Employee_status != "Contract")
+count(valid3$Employee_status)
+
+valid3$Employee_status <- NULL
+
+miss_var_summary(valid3)
+```
+
+```{r}
+#binary encoding for Binary variables
+valid3$male <- valid3$gender
+valid3$married <- valid3$marital_status_maried.Y.N.
+
+valid3$male <- ifelse(valid3[[5]] == "Male", 1, 0) %>% sapply(as.numeric)
+valid3$married <- ifelse(valid3[[6]] == "Y", 1, 0) %>% sapply(as.numeric)
+valid3$achievement_target_3 <- ifelse(valid3$achievement_target_3 == "reached", 1, 0) %>% sapply(as.numeric)
+
+valid3$gender <- NULL
+valid3$marital_status_maried.Y.N. <- NULL
+
+str(valid3)
+```
+
+```{r}
+#category binning year_grad var
+summary(as.numeric(as.character(valid3$year_graduated)))
+valid3 <- valid3 %>%
+  mutate(year_grad =
+           as.factor(
+           case_when(is.na(year_graduated) ~ "none",
+                     year_graduated == 0 ~ "none",
+                     year_graduated >= 1980 & year_graduated <= 1990 ~ "1981 - 1990",
+                     year_graduated >= 1991 & year_graduated <= 2000 ~ "1991 - 2000",
+                     year_graduated >= 2001 & year_graduated <= 2010 ~ "2001 - 2010",
+                     year_graduated >= 2011 & year_graduated <= 2020 ~ "2011 - 2020")
+                    )
+         )
+count(valid3$year_grad)
+valid3$year_graduated <- NULL
+miss_var_summary(valid3)
+```
+
+
+```{r}
+#turning birthyear to age
+valid3$age <- 2020 - valid3$age
+```
+
+```{r}
+#simplifying variable names
+valid3$number_of_dependences_male <- valid3$`number_of_dependences (male)`
+valid3$number_of_dependences_female <- valid3$`number_of_dependences (female)`
+valid3$avg_achievement_pct <- valid3$`Avg_achievement_%`
+valid3$last_achievement_pct <- valid3$`Last_achievement_%`
+valid3$achievement_above_100_pct_3quartal <- as.factor(valid3$`Achievement_above_100%_during3quartal`)
+valid3$best_performance <- valid3$`Best Performance`
+valid3$annual_leave <- valid3$`annual leave`
+
+valid3$`number_of_dependences (male)` <- NULL
+valid3$`number_of_dependences (female)` <- NULL
+valid3$`Avg_achievement_%` <- NULL
+valid3$`Last_achievement_%` <- NULL
+valid3$`Achievement_above_100%_during3quartal` <- NULL
+valid3$`Best Performance` <- NULL
+valid3$`annual leave` <- NULL
+```
+
+```{r}
+count(as.factor(as.numeric(df3$achievement_above_100_pct_3quartal)))
+valid3$achievement_above_100_pct_3quartal <- as.numeric(valid3$achievement_above_100_pct_3quartal)
+str(df3)
+str(valid3)
+```
+
+```{r}
+#one hot encoding the rest of categorical vars
+library(caret)
+hot_var <- names(which(sapply(valid3, is.factor)))
+hot_var
+hot_form <- as.formula(paste("~ ", paste(hot_var, collapse = " + ")))
+one_hot <- dummyVars(hot_form,
+                     data = valid3)
+valid5 <- data.frame(predict(one_hot,
+                          newdata = valid3))
+names(valid5)
+```
+
+```{r}
+#integrating one hot encoded vars to main dataframe
+fac_ind <- paste(which(sapply(valid3, is.factor)), collapse = ", ")
+fac_ind
+valid4 <- valid3[c(-1:-6, -22)]
+str(valid3)
+
+valid6 <- cbind(valid4, valid5)
+str(df6)
+str(valid6)
+```
+
+```{r}
+nd6 <- data.frame(names(df6))
+nv6 <- data.frame(names(valid6))
+miss_var_summary(valid6)
+```
+
+
+```{r}
+valid6$'Best Performance' <- predict(model, newdata = valid6, type = "prob")[ , "yes"]
+```
+
+
+```{r}
+valid6$index <- 0:(nrow(valid)-1)
+```
+
+```{r}
+submission <- valid6[ , c("index", "Best Performance")]
+str(submission)
+```
+
+```{r}
+write.csv(submission, file = "caret_rf_ROSE_7Jan.csv", row.names = FALSE)
+```
+

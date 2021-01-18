@@ -1,0 +1,246 @@
+---
+title: "BRI Hackathon"
+output: html_notebook
+---
+
+#0. Load Library
+
+```{r}
+rm(list = ls())
+```
+
+
+```{r}
+library(readr) #load the data
+library(dplyr) #use pipeline
+library(plyr) #count function
+library(stringr) #string manipulation
+library(vtreat) #one hot encoding to numerical and clean
+library(xgboost) #gradient boosted model
+```
+
+#1. Load Data
+
+```{r}
+df <- read_csv("train.csv")
+head(df)
+```
+
+#2. Feature Engineering
+
+```{r}
+str(df)
+```
+
+```{r}
+df1 <- df[ , sapply(df, class) == "character"] %>%
+  lapply(as.factor) %>%
+  as.data.frame()
+str(df1)
+lapply(df1, levels)
+```
+
+```{r}
+count(df1$year_graduated)
+```
+
+```{r}
+df1$year_graduated <- df1$year_graduated %>%
+  as.character() %>%
+  as.integer() %>%
+  ifelse(df1$year_graduated %in% c(1983:2020), ., NA)
+```
+
+```{r}
+str(df1)
+```
+
+```{r}
+count(df1$achievement_target_1)
+count(df1$achievement_target_2)
+count(df1$achievement_target_3)
+```
+
+
+```{r}
+achieve <- function(x, orb1, orb2 = NULL, new) {
+  ifelse(x %in% c(orb1, orb2), new, as.character(x)) %>%
+    as.factor()
+}
+```
+
+```{r}
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+```
+
+```{r}
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+```
+
+```{r}
+df1$achievement_target_3 <- achieve(df1$achievement_target_3, "not reached", new = "not_reached")
+```
+
+
+```{r}
+df2 <- df[ , sapply(df, class) == "numeric"] %>%
+  as.data.frame()
+```
+
+```{r}
+df3 <- cbind(df1, df2)
+str(df3)
+```
+
+```{r}
+colSums(is.na(df3))
+```
+
+#2.2. Imputing Data
+
+```{r}
+gp <- runif(nrow(df3))
+df_code <- df3[gp < 0.2, ]
+df_train <- df3[gp >= 0.2 & gp <= 0.8, ]
+df_test <- df3[gp > 0.8, ]
+```
+
+
+```{r}
+vars <- df3 %>%
+  select(-`Best Performance`) %>%
+  colnames()
+```
+
+
+```{r}
+treatplan <- designTreatmentsZ(df_code, vars, verbose = FALSE)
+```
+
+```{r}
+levels(as.factor(treatplan$scoreFrame$code))
+```
+
+```{r}
+library(magrittr)
+newvars <- treatplan %>%
+  use_series(scoreFrame) %>%
+  filter(code %in% c("lev", "clean", "isBAD")) %>%
+  use_series(varName)
+
+df_treat <- prepare(treatplan, df_train, varRestriction = newvars)
+```
+
+
+#4. Modeling
+```{r}
+cv <- xgb.cv(data = as.matrix(df_treat),
+             label = df_train$`Best Performance`,
+             nrounds = 1000,
+             nfold = 10,
+             objective = "reg:logistic",
+             eta = 0.3,
+             max_depth = 5,
+             early_stopping_rounds = 10,
+             verbose = 0)
+```
+
+```{r}
+elog <- cv$evaluation_log
+ntrees <- elog %>%
+  summarize(train = which.min(train_rmse_mean),
+            test = which.min(test_rmse_mean))
+ntrees
+```
+
+```{r}
+model <- xgboost(data = as.matrix(df_treat),
+             label = df_train$`Best Performance`,
+             nrounds = ntrees$train,
+             objective = "reg:logistic",
+             eta = 0.3,
+             depth = 5,
+             early_stopping_rounds = 10,
+             verbose = 0)
+```
+
+```{r}
+acc_treat <- prepare(treatplan, df_test, varRestriction = newvars)
+df_test$pred <- predict(model, as.matrix(acc_treat))
+```
+
+```{r}
+library(pROC)
+ROC <- roc(df_test$`Best Performance`, df_test$pred)
+plot(ROC, col = "red")
+ROC$auc
+```
+
+#5. Predicting
+
+```{r}
+valid <- read_csv("test.csv")
+valid1 <- valid[ , sapply(valid, class) == "character"] %>%
+  lapply(as.factor) %>%
+  as.data.frame()
+```
+
+```{r}
+valid1$year_graduated <- valid1$year_graduated %>%
+  as.character() %>%
+  as.integer() %>%
+  ifelse(valid1$year_graduated %in% c(1983:2020), ., NA)
+```
+
+```{r}
+#target1
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+
+#target2
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+
+#target3
+valid1$achievement_target_3 <- achieve(valid1$achievement_target_3, "not reached", new = "not_reached")
+```
+
+```{r}
+valid2 <- valid[ , sapply(valid, class) == "numeric"] %>%
+  as.data.frame()
+```
+
+```{r}
+valid3 <- cbind(valid1, valid2)
+str(valid3)
+```
+
+```{r}
+valid_treat <- prepare(treatplan, valid3, varRestriction = newvars)
+valid_treat$'Best Performance' <- predict(model, as.matrix(valid_treat))
+```
+
+
+```{r}
+valid_treat$index <- 0:(nrow(valid_treat)-1)
+```
+
+```{r}
+submission <- valid_treat[ , c("index", "Best Performance")]
+str(submission)
+```
+
+```{r}
+write.csv(submission, file = "xgboost_1.csv", row.names = FALSE)
+```
+

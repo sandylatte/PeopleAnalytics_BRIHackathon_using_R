@@ -1,0 +1,478 @@
+---
+title: "BRI Hackathon"
+output: html_notebook
+---
+
+#0. Load Library
+
+```{r}
+rm(list = ls())
+```
+
+
+```{r}
+library(readr) #load the data
+library(dplyr) #use pipeline
+library(plyr) #count function
+library(stringr) #string manipulation
+library(vtreat) #one hot encoding to numerical and clean
+library(xgboost) #gradient boosted model
+library(naniar) #missing data summary
+library(visdat) #missing visualization
+library(CatEncoders) #categorical encoding
+```
+
+#1. Load Data
+
+```{r}
+df <- read_csv("train.csv")
+head(df)
+```
+
+#2. Feature Engineering
+
+```{r}
+str(df)
+```
+
+```{r}
+df1 <- df[ , sapply(df, class) == "character"] %>%
+  lapply(as.factor) %>%
+  as.data.frame()
+str(df1)
+lapply(df1, levels)
+```
+
+```{r}
+df %>%
+  filter(!(df1$year_graduated %in% c(1983:2020, NA)))
+```
+
+
+```{r}
+df1$year_graduated <- df1$year_graduated %>%
+  as.character() %>%
+  as.integer() %>%
+  ifelse(df1$year_graduated %in% c(1983:2020), ., NA) %>%
+  as.factor()
+
+count(df1$year_graduated)
+```
+
+
+```{r}
+str(df1)
+```
+
+```{r}
+count(df1$achievement_target_1)
+count(df1$achievement_target_2)
+count(df1$achievement_target_3)
+```
+
+
+```{r}
+achieve <- function(x, orb1, orb2 = NULL, new) {
+  ifelse(x %in% c(orb1, orb2), new, as.character(x)) %>%
+    as.factor()
+}
+
+```
+
+```{r}
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+df1$achievement_target_1 <- achieve(df1$achievement_target_1, "Tidak diberikan target", new = "no_target")
+```
+
+```{r}
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+df1$achievement_target_2 <- achieve(df1$achievement_target_2, "Tidak diberikan target", new = "no_target")
+```
+
+```{r}
+df1$achievement_target_3 <- achieve(df1$achievement_target_3, "not reached", new = "not_reached")
+```
+
+```{r}
+count(df1$achievement_target_1)
+count(df1$achievement_target_2)
+count(df1$achievement_target_3)
+```
+
+
+```{r}
+df2 <- df[ , sapply(df, class) == "numeric"] %>%
+  as.data.frame()
+```
+
+```{r}
+df3 <- cbind(df1, df2)
+str(df3)
+```
+
+
+```{r}
+#Checking missing variable
+miss_var_summary(df3)
+glimpse(df3)
+```
+
+```{r}
+#Checking the Education_level, GPA, and year_graduated variables have the same missing case
+df3 %>%
+  filter(is.na(Education_level) & is.na(GPA) & is.na(year_graduated)) %>%
+  nrow()
+
+#the result is 3503 which is exactly the total amount of NAs for GPA variable, it means all NAs in GPA indicate no education background which automatically explains no graduation
+
+count(df3$Education_level)
+df3$Education_level <- ifelse(is.na(df3$GPA) & is.na(df3$Education_level), "level_0", as.character(df3$Education_level)) %>% as.factor()
+count(df3$Education_level)
+
+count(df3$year_graduated)
+df3$year_graduated <- ifelse(is.na(df$GPA) & is.na(df3$year_graduated), 0, as.character(df3$year_graduated)) %>%
+  as.factor()
+count(df3$year_graduated)
+
+count(df3$GPA)
+df3$GPA <- ifelse(is.na(df3$GPA), 0, as.numeric(df3$GPA))
+count(df3$GPA)
+```
+
+```{r}
+miss_var_summary(df3)
+```
+
+
+```{r Identifying correlation between employee_status and the missingness of relevant variables}
+
+gg_miss_var(df3, facet = Employee_status)
+gg_miss_var(df3, facet = Employee_type)
+gg_miss_var(df3, facet = gender)
+gg_miss_var(df3, facet = person_level)
+gg_miss_var(df3, facet = job_level)
+gg_miss_var(df3, facet = marital_status_maried.Y.N.)
+gg_miss_var(df3, facet = Education_level)
+
+x <- as.data.frame(colnames(df3))
+
+con_var <- c(9:11, 20, 28:30)
+
+for(i in con_var) {
+  count(df3[[i]]) %>%
+    print()
+}
+```
+
+```{r}
+# Replacing NAs relevant to Contract Employee
+con_var_fac <- c(9:10)
+con_var_int <- c(20, 28:29)
+
+#for categorical vars
+for(j in con_var_fac) {
+con <- function(j, l = "no_target") {
+ifelse((df3$Employee_status == "Contract" & is.na(df3[[j]])), l, as.character(df3[[j]])) %>%
+  as.factor()
+}
+  df3[[j]] <- con(j)
+  count(df3[[j]]) %>%
+    print()
+}
+
+df3[[11]] <- con(11, "not_reached")
+  count(df3[[11]])
+  
+df3[[30]] <- con(30, 0)
+  count(df3[[30]])
+
+  
+#for numerical vars
+for(k in con_var_int) {
+con_int <- function(k) {
+ifelse((df3$Employee_status == "Contract" & is.na(df3[[k]])), 0, df3[[k]])
+}
+  df3[[k]] <- con_int(k)
+  count(df3[[k]]) %>%
+    print()
+}
+gg_miss_var(df3, facet = Employee_status)
+miss_var_summary(df3)
+str(df3)
+```
+
+
+```{r}
+#check all categorical variables
+factors <- df3[names(which(sapply(df3, is.factor)))]
+sapply(factors, levels)
+```
+
+```{r}
+#binary encoding for Binary variables
+df3$permanent_employee <- df3$Employee_status
+df3$male <- df3$gender
+df3$married <- df3$marital_status_maried.Y.N.
+
+df3$permanent_employee <- ifelse(df3[[4]] == "Permanent", 1, 0) %>% sapply(as.factor)
+df3$male <- ifelse(df3[[5]] == "Male", 1, 0) %>% sapply(as.factor)
+df3$married <- ifelse(df3[[6]] == "Y", 1, 0) %>% sapply(as.factor)
+
+df3$Employee_status <- NULL
+df3$gender <- NULL
+df3$marital_status_maried.Y.N. <- NULL
+
+str(df3)
+```
+
+```{r}
+#turning birthyear to age
+df3$age <- 2020 - df3$age
+```
+
+
+```{r}
+#simplifying variable names
+df3$number_of_dependences_male <- df3$`number_of_dependences (male)`
+df3$number_of_dependences_female <- df3$`number_of_dependences (female)`
+df3$avg_achievement_pct <- df3$`Avg_achievement_%`
+df3$last_achievement_pct <- df3$`Last_achievement_%`
+df3$achievement_above_100_pct_3quartal <- df3$`Achievement_above_100%_during3quartal`
+df3$best_performance <- df3$`Best Performance`
+df3$annual_leave <- df3$`annual leave`
+
+df3$`number_of_dependences (male)` <- NULL
+df3$`number_of_dependences (female)` <- NULL
+df3$`Avg_achievement_%` <- NULL
+df3$`Last_achievement_%` <- NULL
+df3$`Achievement_above_100%_during3quartal` <- NULL
+df3$`Best Performance` <- NULL
+df3$`annual leave` <- NULL
+```
+
+
+```{r}
+str(df3)
+miss_var_summary(df3)
+count(df3$best_performance)
+```
+
+```{r}
+#since the data is imbalance, ROSE is used as sampling method
+library(ROSE)
+df4 <- ROSE(best_performance ~ .,
+            data = df3)$data
+```
+
+```{r}
+#impute NAs
+library(missForest)
+df4_imp <- missForest(df4, variablewise = TRUE, )
+df4_imp$OOBerror
+df5 <- df4_imp$ximp
+colSums(is.na(df5))
+```
+
+
+```{r}
+gp <- runif(nrow(df5))
+df_code <- df5[gp < 0.1, ]
+df_train <- df5[gp >= 0.1 & gp <= 0.9, ]
+df_test <- df5[gp > 0.1, ]
+```
+
+
+```{r}
+vars <- df5 %>%
+  select(-best_performance) %>%
+  colnames()
+vars
+```
+
+
+```{r}
+treatplan <- designTreatmentsZ(df_code, vars, verbose = FALSE)
+```
+
+```{r}
+levels(as.factor(treatplan$scoreFrame$code))
+```
+
+```{r}
+library(magrittr)
+library(vtreat)
+newvars <- treatplan %>%
+  use_series(scoreFrame) %>%
+  filter(code %in% c("lev", "clean", "isBAD")) %>%
+  use_series(varName)
+
+df_treat <- prepare(treatplan, df_train, varRestriction = newvars)
+names(df_treat)
+```
+
+
+#4. Modeling
+```{r}
+cv <- xgb.cv(data = as.matrix(df_treat),
+             label = df_train$best_performance,
+             nrounds = 500,
+             nfold = 10,
+             objective = "reg:logistic",
+             eta = 0.3,
+             max_depth = 5,
+             early_stopping_rounds = 10,
+             verbose = 0)
+```
+
+```{r}
+elog <- cv$evaluation_log
+ntrees <- elog %>%
+  summarize(train = which.min(train_rmse_mean),
+            test = which.min(test_rmse_mean))
+ntrees
+```
+
+```{r}
+model <- xgboost(data = as.matrix(df_treat),
+             label = df_train$best_performance,
+             nrounds = ntrees$train,
+             objective = "reg:logistic",
+             eta = 0.3,
+             depth = 5,
+             early_stopping_rounds = 10,
+             verbose = 0)
+```
+
+```{r}
+acc_treat <- prepare(treatplan, df_test, varRestriction = newvars)
+df_test$pred <- predict(model, as.matrix(acc_treat))
+```
+
+```{r}
+library(pROC)
+ROC <- roc(df_test$best_performance, df_test$pred)
+plot(ROC, col = "red")
+ROC$auc
+```
+
+#5. Predicting
+
+```{r}
+valid <- read_csv("test.csv")
+valid1 <- valid[ , sapply(valid, class) == "character"] %>%
+  lapply(as.factor) %>%
+  as.data.frame()
+```
+
+```{r}
+valid1$year_graduated <- valid1$year_graduated %>%
+  as.character() %>%
+  as.integer() %>%
+  ifelse(valid1$year_graduated %in% c(1983:2020), ., NA)
+```
+
+```{r}
+#target1
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+valid1$achievement_target_1 <- achieve(valid1$achievement_target_1, "Tidak diberikan target", new = "no_target")
+
+#target2
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_< 50%", "Pencapaian < 50%", "< 50%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_50%-100%", "Pencapaian 100%-150%", "50% - 100%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_100%-150%", "Pencapaian 50%-100%", "100% - 150%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "achiev_> 1.5", "Pencapaian > 1.5", "> 150%")
+valid1$achievement_target_2 <- achieve(valid1$achievement_target_2, "Tidak diberikan target", new = "no_target")
+
+#target3
+valid1$achievement_target_3 <- achieve(valid1$achievement_target_3, "not reached", new = "not_reached")
+```
+
+```{r}
+valid2 <- valid[ , sapply(valid, class) == "numeric"] %>%
+  as.data.frame()
+```
+
+```{r}
+valid3 <- cbind(valid1, valid2)
+str(valid3)
+```
+
+```{r}
+#Imputing NAs
+miss_var_summary(valid3)
+library(missForest)
+valid3_imp <- missForest(valid3, variablewise = TRUE, )
+valid3_imp$OOBerror
+```
+
+```{r}
+valid3 <- valid3_imp$ximp
+miss_var_summary(valid3)
+```
+
+
+```{r}
+#binary encoding for Binary variables
+valid3$permanent_employee <- valid3$Employee_status
+valid3$male <- valid3$gender
+valid3$married <- valid3$marital_status_maried.Y.N.
+
+valid3$permanent_employee <- ifelse(valid3[[4]] == "Permanent", 1, 0) %>% sapply(as.factor)
+valid3$male <- ifelse(valid3[[5]] == "Male", 1, 0) %>% sapply(as.factor)
+valid3$married <- ifelse(valid3[[6]] == "Y", 1, 0) %>% sapply(as.factor)
+
+valid3$Employee_status <- NULL
+valid3$gender <- NULL
+valid3$marital_status_maried.Y.N. <- NULL
+
+str(valid3)
+```
+
+
+```{r}
+#simplifying variable names
+valid3$number_of_dependences_male <- valid3$`number_of_dependences (male)`
+valid3$number_of_dependences_female <- valid3$`number_of_dependences (female)`
+valid3$avg_achievement_pct <- valid3$`Avg_achievement_%`
+valid3$last_achievement_pct <- valid3$`Last_achievement_%`
+valid3$achievement_above_100_pct_3quartal <- as.factor(valid3$`Achievement_above_100%_during3quartal`)
+valid3$best_performance <- valid3$`Best Performance`
+valid3$annual_leave <- valid3$`annual leave`
+
+valid3$`number_of_dependences (male)` <- NULL
+valid3$`number_of_dependences (female)` <- NULL
+valid3$`Avg_achievement_%` <- NULL
+valid3$`Last_achievement_%` <- NULL
+valid3$`Achievement_above_100%_during3quartal` <- NULL
+valid3$`Best Performance` <- NULL
+valid3$`annual leave` <- NULL
+```
+
+```{r}
+valid_treat <- prepare(treatplan, valid3, varRestriction = newvars)
+valid_treat$'Best Performance' <- predict(model, as.matrix(valid_treat))
+```
+
+
+```{r}
+valid_treat$index <- 0:(nrow(valid_treat)-1)
+```
+
+```{r}
+submission <- valid_treat[ , c("index", "Best Performance")]
+str(submission)
+```
+
+```{r}
+write.csv(submission, file = "xgboost_ROSE.csv", row.names = FALSE)
+```
+
